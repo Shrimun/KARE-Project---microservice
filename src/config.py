@@ -49,8 +49,17 @@ class Settings:
     response_instructions_path: Path = Path(os.getenv("RESPONSE_INSTRUCTIONS_PATH", "instruction.txt"))
     response_instructions: str = field(default_factory=_load_response_instructions)
     response_model: str = os.getenv("RESPONSE_MODEL", "gpt-4.1-nano")
-    response_max_tokens= int = int(os.getenv("RESPONSE_MAX_TOKENS", "300"))
+    response_max_tokens: int = int(os.getenv("RESPONSE_MAX_TOKENS", "300"))
     response_temperature: float = float(os.getenv("RESPONSE_TEMPERATURE", "0.0"))
+    
+    # MongoDB settings
+    mongodb_uri: str = os.getenv("MONGODB_URI", "mongodb://mongodb:27017")
+    mongodb_database: str = os.getenv("MONGODB_DATABASE", "kare_qa_db")
+    
+    # JWT settings
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "")
+    jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
+    access_token_expire_hours: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "24"))
 
 # Caches and returns the settings instance
 # This ensures that settings are only loaded once.

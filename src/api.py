@@ -7,11 +7,12 @@ import json
 import logging
 import traceback
 from functools import lru_cache
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -20,11 +21,33 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from src.config import Settings, get_settings
 from src.openai_client import OpenAIClient, OpenAIClientConfig
 from src.vector_store import get_vector_store, RetrievedChunk, VectorStore
+from src.database import connect_to_mongodb, close_mongodb_connection, get_database
+from src.user_service import UserService
+from src.models import UserCreate, UserLogin, TokenResponse, UserResponse, LogoutResponse
+from src.auth import decode_access_token
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI(title="Question Answering Service", version="1.0.0")
+
+# Security
+security = HTTPBearer()
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connection on startup."""
+    logger.info("Starting up application...")
+    await connect_to_mongodb()
+    logger.info("Application startup complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connection on shutdown."""
+    logger.info("Shutting down application...")
+    await close_mongodb_connection()
+    logger.info("Application shutdown complete")
 
 # Models / validation
 class SourceAttribution(BaseModel):
@@ -264,6 +287,75 @@ def get_vector_store_dep(settings: Settings = Depends(get_settings_dep)) -> Vect
 def get_openai_client_dep(settings: Settings = Depends(get_settings_dep)) -> OpenAIClient:
     return _get_openai_client_cached(settings)
 
+def get_user_service_dep() -> UserService:
+    """Dependency to get UserService instance."""
+    return UserService(get_database())
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user_service: UserService = Depends(get_user_service_dep)
+) -> UserResponse:
+    """
+    Dependency to get the current authenticated user.
+    
+    Validates the JWT token and returns the user information.
+    Raises HTTPException if token is invalid or user not found.
+    """
+    token = credentials.credentials
+    
+    # Decode and validate token
+    try:
+        payload = decode_access_token(token)
+        user_id: str = payload.get("sub")
+        
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token decode error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from e
+    
+    # Validate session exists
+    user_id_from_session = await user_service.validate_session(token)
+    if not user_id_from_session or user_id_from_session != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Get user from database
+    user = await user_service.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inactive user account"
+        )
+    
+    return UserResponse(
+        user_id=user.user_id,
+        name=user.name,
+        email=user.email,
+        department=user.department,
+        phone_number=user.phone_number,
+        created_at=user.created_at,
+    )
+
 def _error_payload(status_code: int, message: str, *, details: object | None = None) -> dict[str, object]:
     def _json_safe(value: object) -> object:
         if value is None:
@@ -301,16 +393,166 @@ def _error_response(status_code: int, message: str, *, details: object | None = 
 def _serialize_event(event_name: str, payload: dict) -> bytes:
     return (json.dumps({"event": event_name, "data": payload}) + "\n").encode("utf-8")
 
+# Authentication Endpoints
+@app.post("/signup", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def signup(
+    user_data: UserCreate,
+    request: Request,
+    user_service: UserService = Depends(get_user_service_dep)
+):
+    """
+    Register a new user account.
+    
+    **Requirements:**
+    - Email must end with @klu.ac.in
+    - Password must be at least 8 characters with uppercase, lowercase, and digit
+    - Phone number must be valid Indian format (10 digits or +91 followed by 10 digits)
+    
+    **Returns:**
+    - Access token (JWT)
+    - User information
+    """
+    try:
+        # Get client info
+        user_agent = request.headers.get("user-agent")
+        ip_address = request.client.host if request.client else None
+        
+        # Create user
+        user_response, access_token = await user_service.create_user(
+            user_data,
+            user_agent=user_agent,
+            ip_address=ip_address
+        )
+        
+        logger.info(f"New user signed up: {user_response.email}")
+        
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=user_response
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Signup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user account"
+        ) from e
+
+
+@app.post("/login", response_model=TokenResponse)
+async def login(
+    credentials: UserLogin,
+    request: Request,
+    user_service: UserService = Depends(get_user_service_dep)
+):
+    """
+    Login with email and password.
+    
+    **Returns:**
+    - Access token (JWT) - use this in Authorization header as "Bearer <token>"
+    - User information
+    """
+    try:
+        # Get client info
+        user_agent = request.headers.get("user-agent")
+        ip_address = request.client.host if request.client else None
+        
+        # Authenticate user
+        user_response, access_token = await user_service.authenticate_user(
+            credentials.email,
+            credentials.password,
+            user_agent=user_agent,
+            ip_address=ip_address
+        )
+        
+        logger.info(f"User logged in: {user_response.email}")
+        
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=user_response
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Login failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login failed"
+        ) from e
+
+
+@app.post("/logout", response_model=LogoutResponse)
+async def logout(
+    current_user: UserResponse = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user_service: UserService = Depends(get_user_service_dep)
+):
+    """
+    Logout the current user and invalidate their session.
+    
+    **Requires:** Valid Bearer token in Authorization header
+    """
+    try:
+        token = credentials.credentials
+        
+        # Delete session
+        was_logged_out = await user_service.logout_user(token)
+        
+        if not was_logged_out:
+            logger.warning(f"Session not found for user: {current_user.email}")
+        
+        from datetime import datetime, timezone
+        
+        logger.info(f"User logged out: {current_user.email}")
+        
+        return LogoutResponse(
+            message="Successfully logged out",
+            logged_out_at=datetime.now(timezone.utc)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Logout failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Logout failed"
+        ) from e
+
+
+@app.get("/me", response_model=UserResponse)
+async def get_current_user_info(current_user: UserResponse = Depends(get_current_user)):
+    """
+    Get current user's profile information.
+    
+    **Requires:** Valid Bearer token in Authorization header
+    """
+    return current_user
+
 # Endpoints 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(
     body: AskRequest,
+    current_user: UserResponse = Depends(get_current_user),
     stream: bool = Query(False, description="Stream chunked progress events"),
     settings: Settings = Depends(get_settings_dep),
     vector_store: VectorStore = Depends(get_vector_store_dep),
     openai_client: OpenAIClient = Depends(get_openai_client_dep),
 ):
-    logger.info("Received question request: %s", body.question)
+    """
+    Ask a question and get an AI-generated answer with source citations.
+    
+    **Requires:** Valid Bearer token in Authorization header
+    
+    **Query Parameters:**
+    - stream: Set to true to receive streaming responses
+    
+    **Returns:**
+    - Answer with source attributions
+    """
+    logger.info(f"Question from user {current_user.email}: {body.question}")
 
     # Retrieve context with retries handled in the wrapper
     chunks = await _retrieve_context(
