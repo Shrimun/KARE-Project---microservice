@@ -642,6 +642,28 @@ async def health_check() -> JSONResponse:
     """Health check endpoint."""
     return JSONResponse(content={"status": "ok"}, status_code=status.HTTP_200_OK)
 
+
+@app.get("/departments", status_code=status.HTTP_200_OK)
+async def get_departments() -> JSONResponse:
+    """
+    Get list of available departments.
+    
+    **Public endpoint** - No authentication required.
+    
+    Returns:
+        List of department codes
+    """
+    departments = [
+        {"code": "CSE", "name": "Computer Science and Engineering"},
+        {"code": "ECE", "name": "Electronics and Communication Engineering"},
+        {"code": "CIVIL", "name": "Civil Engineering"},
+        {"code": "MECH", "name": "Mechanical Engineering"},
+        {"code": "BME", "name": "Biomedical Engineering"},
+        {"code": "EEE", "name": "Electrical and Electronics Engineering"}
+    ]
+    return JSONResponse(content={"departments": departments}, status_code=status.HTTP_200_OK)
+
+
 # manual test endpoint for general info
 @app.get("/", response_class=JSONResponse)
 async def root() -> JSONResponse:
@@ -650,7 +672,12 @@ async def root() -> JSONResponse:
         "service": "Question Answering Service",
         "version": "1.0.0",
         "endpoints": {
-            "/ask": "POST endpoint to ask a question",
+            "/signup": "POST endpoint to create a new user account",
+            "/login": "POST endpoint to authenticate and get token",
+            "/logout": "POST endpoint to invalidate session",
+            "/me": "GET endpoint to get current user profile (requires auth)",
+            "/ask": "POST endpoint to ask a question (requires auth)",
+            "/departments": "GET endpoint to list available departments (public)",
             "/health": "GET health check endpoint",
         },
     }
